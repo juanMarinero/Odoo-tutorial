@@ -2918,6 +2918,327 @@ sudo docker compose up -d       # recreate containers with the new images
 >
 > After that, `docker volume ls | grep odoo` shows only the two volumes in use.
 
+
+### Building a custom Odoo image with a Dockerfile
+
+Everything up to this point uses the **official `odoo:20.0` image as-is**.
+That is sufficient for testing, but you will eventually need at least one of:
+
+- Extra **Python dependencies** (a custom module imports a library Odoo doesn't bundle),
+- **Custom Odoo addons** baked into the image (as opposed to mounted as a volume),
+- Extra **system packages** (fonts, OCR tools, a specific `wkhtmltopdf` build, …).
+
+For those you write a **Dockerfile** that extends the official image, and let Compose produce a custom image from it.
+
+#### What a Dockerfile is (and is not)
+
+- **Dockerfile** = recipe for **one image**. A text file with instructions (`FROM`, `RUN`, `COPY`, `CMD`, …) executed top-to-bottom, layer by layer.
+- It **builds** the Odoo image. It never defines the database, the network, the volumes, or the port mapping — those are runtime concerns.
+- **Docker Compose** = recipe for **one stack**: which images to run, how they network, what to mount, which env vars. Compose can *invoke* a Dockerfile via `build:`, but it never does `COPY` itself.
+
+That separation answers the two most common questions:
+
+##### Why the Dockerfile doesn't mention `postgres:16`
+
+Because PostgreSQL is a **completely separate image** (`postgres:16`) pulled from Docker Hub.
+It has its own upstream Dockerfile and you don't need to touch it.
+The Odoo Dockerfile describes only the Odoo image.
+
+The **Compose file** is what ties the two images together into one running application.
+
+It's not *"not possible"* — it's simply outside the Dockerfile's scope.
+
+##### Can Compose be as specific as `COPY ./custom-addons /mnt/extra-addons`?
+
+**Not directly.** There is no `COPY` instruction in Compose — Compose orchestrates containers from already-built images. The two equivalents:
+
+| Dockerfile instruction | Compose equivalent | When it happens |
+|---|---|---|
+| `COPY ./custom-addons /mnt/extra-addons` | `build:` → points to your Dockerfile | Build time |
+| Same intent, different mechanism | `volumes: - ./custom-addons:/mnt/extra-addons` | Runtime (bind mount) |
+
+So the *"equivalent"* **Compose file** uses:
+- **`build:`** to have Compose build your Odoo image from the Dockerfile (preserving `COPY` and `pip install`),
+- and **`volumes:`** for runtime data persistence (which `COPY` can never do).
+
+#### Example Dockerfile for Odoo
+
+```dockerfile
+# Use a specific official Odoo version as the base for stability
+FROM odoo:20.0
+
+# Switch to root to install system packages or Python libraries
+USER root
+
+# (Optional) Install any extra system dependencies Odoo might need
+# Example: for specific reporting libraries or fonts
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     some-package \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Copy your custom Python requirements and install them
+# This layer is cached unless the requirements file changes
+COPY ./requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
+
+# (Optional) Copy custom addons directly into the image
+# Alternatively, mount them as a volume in Docker Compose for development
+COPY ./custom-addons /mnt/extra-addons
+
+# Ensure the odoo user owns the necessary directories
+RUN chown -R odoo:odoo /mnt/extra-addons
+
+# Switch back to the non-root odoo user for security
+USER odoo
+
+# The base image already defines the CMD to start Odoo, so it's often optional
+# CMD ["odoo"]
+```
+
+Line by line:
+
+- **`FROM odoo:20.0`** — foundation. Using the official image saves you from manually installing Python, PostgreSQL client libraries, and `wkhtmltopdf`.
+  Pinning a version (like `20.0`) prevents unexpected changes when `latest` is pushed.
+- **`USER root` / `USER odoo`** — you temporarily need root to install packages or change file ownership.
+  Switching back to the `odoo` user before the container starts is a security best practice.
+- **`COPY requirements.txt` + `RUN pip3 install`** — the most common customization: extra Python libraries for your modules.
+  `--break-system-packages` is often necessary with newer base images to allow pip installs outside a virtualenv.
+- **`COPY custom-addons /mnt/extra-addons`** — bakes your custom Odoo modules into the image.
+  The `chown` ensures Odoo can read/write them. For **development**, skip this and bind-mount the folder instead (see below).
+- **No `CMD`** — the official Odoo image already includes the correct entrypoint and command. You only override it for a very specific startup script.
+
+#### Directory layout
+
+```
+~/docker/odoo-custom/
+├── Dockerfile
+├── requirements.txt            # extra Python deps (can be empty)
+├── custom-addons/              # your custom Odoo modules
+│   └── my_module/
+│       ├── __init__.py
+│       ├── __manifest__.py
+│       └── ...
+└── compose.yaml                # builds and runs the stack
+```
+
+#### Equivalent `compose.yaml`
+
+This is the Compose equivalent of the "Example Dockerfile" above: it **builds** the custom Odoo image from the Dockerfile and runs it alongside the DB container.
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+    volumes:
+      - odoo-custom-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  odoo:
+    build:
+      context: .                  # folder containing the Dockerfile
+      dockerfile: Dockerfile      # runs COPY, pip install, etc.
+    image: odoo-custom:20.0       # tag for the locally built image
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8070:8069"     # loopback-only, matches source Odoo
+    environment:
+      # No HOST needed: the service is named `db`, which matches
+      # the Odoo image's default HOST=db
+      USER: odoo
+      PASSWORD: odoo
+    volumes:
+      - odoo-custom-web-data:/var/lib/odoo
+      # Development alternative to COPY: bind-mount host addons live.
+      # Uncomment to override the baked-in /mnt/extra-addons.
+      # - ./custom-addons:/mnt/extra-addons
+
+volumes:
+  odoo-custom-db-data:
+  odoo-custom-web-data:
+```
+
+Notable points:
+
+- **`build: context: . / dockerfile: Dockerfile`** — this is the Compose equivalent of *"use the Dockerfile"*.
+  It makes Compose **build** the Odoo image, so `COPY ./custom-addons /mnt/extra-addons` and `pip3 install` run at build time. Without `build:`, Compose would pull `odoo:20.0` and ignore your Dockerfile entirely.
+- **`image: postgres:16`** — pulls the official Postgres image. No Dockerfile needed. This is why the Odoo Dockerfile never mentions Postgres.
+- **`volumes: odoo-custom-db-data:/var/lib/postgresql/data`** — runtime persistence. `COPY` can't do this; volumes survive container rebuilds.
+- **`volumes: ./custom-addons:/mnt/extra-addons` (commented)** — the **runtime alternative** to `COPY`.
+  If you uncomment it, the host folder **overrides** whatever was baked in at that path. Use one or the other: `COPY` for immutable/production images, bind mount for live development.
+- **`ports: 127.0.0.1:8070:8069`** — loopback-only, matching your source Odoo's `http_interface = 127.0.0.1`. Remove the `127.0.0.1:` prefix if you want LAN access (as in the earlier `docker run` section).
+- **No `HOST=…`** — the Odoo image's default `HOST=db` works because the service is named `db`. (The earlier `docker run` version needed `-e HOST=odoo-docker-db` only because the container was named differently.)
+
+#### Build and run
+
+```sh
+mkdir -p ~/docker/odoo-custom/custom-addons
+cd ~/docker/odoo-custom
+
+# Files needed in this folder: Dockerfile, requirements.txt, custom-addons/, compose.yaml
+$EDITOR Dockerfile
+$EDITOR requirements.txt          # can be an empty file
+$EDITOR compose.yaml
+
+# Build the image (once), then start the stack
+sudo docker compose build
+sudo docker compose up -d
+
+# Or do both in one step
+sudo docker compose up -d --build
+```
+
+Verify:
+
+```sh
+# Two containers, db healthy
+sudo docker compose ps
+
+# The custom image exists locally
+sudo docker image ls odoo-custom
+
+# Web responds
+curl -sI http://localhost:8070/web/login | head -1
+
+# Confirm the extra Python package made it into the image
+sudo docker compose exec odoo pip3 show <your-package>
+
+# Confirm custom addons are present
+sudo docker compose exec odoo ls /mnt/extra-addons
+```
+
+#### Lifecycle commands for a Dockerfile-built stack
+
+Once the stack is up, the daily commands are the same as any Compose project. The only thing that changes vs. the pre-built-image flow is **`build`** vs. **`pull`**.
+
+##### Rebuild after editing the Dockerfile or addons
+
+```sh
+# Rebuild the odoo image from the modified Dockerfile, then recreate
+# only the containers whose config changed. The db container is untouched.
+sudo docker compose up -d --build
+
+# Force a clean rebuild (bypass layer cache; e.g. base image changed)
+sudo docker compose build --no-cache
+sudo docker compose up -d
+```
+
+When to rebuild:
+
+| You changed … | Need rebuild? | Command |
+|---|---|---|
+| `Dockerfile` or `requirements.txt` | ✅ yes | `up -d --build` |
+| Files in `custom-addons/` **baked in with `COPY`** | ✅ yes | `up -d --build` |
+| Files in `custom-addons/` **bind-mounted** (`volumes:`) | ❌ no | `restart odoo` |
+| Only `compose.yaml` (env, ports, volume names) | ❌ no | `up -d` |
+
+```sh
+# Bind-mounted addons changed → just restart
+sudo docker compose restart odoo
+```
+
+##### Pull newer upstream images
+
+```sh
+# Pull newer `postgres:16` (and `odoo:20.0` if you temporarily
+# removed `build:` from compose.yaml)
+sudo docker compose pull
+
+# Recreate containers with newer images. With `build:` still present,
+# this will also rebuild the odoo image — which is usually what you want.
+sudo docker compose up -d
+```
+
+To upgrade the **Odoo base version** (`odoo:20.0` → `odoo:21.0`):
+
+1. Edit the `FROM` line in the Dockerfile.
+2. `sudo docker compose build --no-cache`
+3. `sudo docker compose up -d`
+
+##### Restart without rebuilding
+
+```sh
+# Both containers
+sudo docker compose restart
+
+# Only Odoo (typical for bind-mounted addon edits)
+sudo docker compose restart odoo
+```
+
+##### Stop, start, down
+
+```sh
+sudo docker compose stop      # stop, keep containers + volumes
+sudo docker compose start     # start them again
+sudo docker compose down      # remove containers + network; volumes kept
+sudo docker compose down -v   # ⚠️ also remove volumes → loses DB + filestore
+```
+
+##### Uninstall completely
+
+```sh
+cd ~/docker/odoo-custom
+
+# Remove containers + network (volumes kept)
+sudo docker compose down
+
+# Remove the built image (frees disk space)
+sudo docker image rm odoo-custom:20.0
+
+# Remove the named volumes (⚠️ destroys the DB + filestore)
+# Compose prefixes volumes with the project name (the directory name by default).
+sudo docker volume ls | grep odoo        # confirm the exact names
+sudo docker volume rm \
+  odoo-custom_odoo-custom-db-data \
+  odoo-custom_odoo-custom-web-data
+
+# Remove the project directory
+rm -rf ~/docker/odoo-custom
+```
+
+##### Inspect and debug
+
+Same tools as the rest of this guide:
+
+```sh
+sudo docker compose ps
+sudo docker compose config            # resolved / merged YAML
+sudo docker compose logs odoo --tail=50
+sudo docker compose logs -f odoo      # follow in real time
+
+sudo docker compose exec odoo ls /mnt/extra-addons
+sudo docker compose exec odoo pip3 list
+sudo docker compose exec db psql -U odoo -d postgres -tAc "SHOW server_version;"
+
+# What did the image build actually produce?
+sudo docker history odoo-custom:20.0
+```
+
+#### Key differences vs. the pre-built-image flow used earlier
+
+| Aspect | Pre-built image (`odoo:20.0`) | Custom Dockerfile (`build:`) |
+|---|---|---|
+| Image source | Pulled from Docker Hub | Built locally from Dockerfile |
+| Update mechanism | `compose pull` + `up -d` | Edit Dockerfile → `up -d --build` |
+| Custom addons | Volume mount only | Can be baked in (`COPY`) or mounted |
+| Custom pip packages | Installed at runtime (fragile) | Baked in at build time (clean) |
+| Disk footprint | Small (shared base layers) | Larger (adds your `COPY`/`RUN` layers) |
+| Rebuild frequency | Never (only `pull`) | After any Dockerfile / `requirements.txt` / `COPY`-baked addon change |
+
+The pre-built flow in the main sections of this guide is the right choice for **testing**. The Dockerfile flow is the right choice for **shipping a customized Odoo** (custom modules that need extra Python libraries, fonts, OCR, etc.).
+
+
 ---
 
 
